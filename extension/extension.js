@@ -255,8 +255,11 @@ async function openChat(modeOverride) {
 
 // ---------- Editor tools ----------
 
-function resolveUri(p) {
+// A relative path is relative to the calling thread's folder (X-T3-Thread-Cwd), which can be a T3 worktree
+// of the repo this window has open. Without that header, it is relative to the window's first folder.
+function resolveUri(p, cwd) {
   if (path.isAbsolute(p)) return vscode.Uri.file(p);
+  if (cwd) return vscode.Uri.file(path.join(cwd, p));
   const root = vscode.workspace.workspaceFolders?.[0];
   if (!root) throw new Error("no workspace folder for a relative path");
   return vscode.Uri.joinPath(root.uri, p);
@@ -311,8 +314,8 @@ const tools = {
       },
       required: ["path"],
     },
-    async run({ path: p, startLine, endLine }) {
-      const doc = await vscode.workspace.openTextDocument(resolveUri(p));
+    async run({ path: p, startLine, endLine }, { cwd }) {
+      const doc = await vscode.workspace.openTextDocument(resolveUri(p, cwd));
       const range = toRange(doc, startLine, endLine);
       const editor = await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true, selection: range });
       editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
@@ -322,8 +325,8 @@ const tools = {
   editor_focus: {
     description: "Bring one open file to the front of its editor group. Other tabs stay open behind it.",
     inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-    async run({ path: p }) {
-      const uri = resolveUri(p);
+    async run({ path: p }, { cwd }) {
+      const uri = resolveUri(p, cwd);
       const tab = vscode.window.tabGroups.all.flatMap((g) => g.tabs).find((t) => t.input?.uri?.fsPath === uri.fsPath);
       await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: true, viewColumn: tab?.group.viewColumn });
       return `focused ${p}${tab ? "" : " (was not open)"}`;
@@ -342,8 +345,8 @@ const tools = {
       },
       required: ["path", "startLine", "body"],
     },
-    async run({ path: p, startLine, endLine, body }, { t3ThreadId }) {
-      const uri = resolveUri(p);
+    async run({ path: p, startLine, endLine, body }, { t3ThreadId, cwd }) {
+      const uri = resolveUri(p, cwd);
       const doc = await vscode.workspace.openTextDocument(uri);
       const range = toRange(doc, startLine, endLine);
       const thread = comments.createCommentThread(uri, range, [comment(body, "Agent")]);
@@ -422,6 +425,8 @@ function startMcp() {
               "Do this before you answer, and keep the chat answer short: the steps carry the detail. Do not paste the code in the chat.",
               "The notes of one chat form a trace with numbered steps and arrows between them.",
               "Use editor_open to show a file without a note. A reply to a note arrives in this chat as a message that quotes the note.",
+              "These editor steps come first, even when you also draw an overview with html_render: the page shows the shape, the steps show the real code.",
+              "Never answer a question about this repo's code with html_render alone.",
             ].join(" "),
           },
         });
@@ -437,7 +442,10 @@ function startMcp() {
         const tool = tools[msg.params.name];
         log(`tool ${msg.params.name} thread=${req.headers["x-t3-thread-id"] ?? "?"} ${JSON.stringify(msg.params.arguments)}`);
         try {
-          const text = await tool.run(msg.params.arguments ?? {}, { t3ThreadId: req.headers["x-t3-thread-id"] });
+          const text = await tool.run(msg.params.arguments ?? {}, {
+            t3ThreadId: req.headers["x-t3-thread-id"],
+            cwd: req.headers["x-t3-thread-cwd"],
+          });
           return reply({ result: { content: [{ type: "text", text }] } });
         } catch (e) {
           log(`tool error ${e.message}`);
