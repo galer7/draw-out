@@ -46,21 +46,58 @@ function t3Cli(args) {
   });
 }
 
+// T3 orchestration v2 rejects reads without this header. A v1 server ignores it.
 async function t3Fetch(pathname, init = {}) {
   const token = fs.readFileSync(tokenFile(), "utf8").trim();
   const res = await fetch(cfg().get("t3Url") + pathname, {
     ...init,
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...init.headers },
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "x-t3-orchestration-protocol": "2",
+      ...init.headers,
+    },
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`${res.status} ${pathname}: ${text.slice(0, 300)}`);
   return text ? JSON.parse(text) : null;
 }
 
-// The T3 thread that called a tool. Stock T3 does not tell an MCP server which thread calls it,
+// Both versions list threads with id, title, runtimeMode and interactionMode. Only v2 has schemaVersion.
+const t3Shell = () => t3Fetch("/api/orchestration/shell");
+const isV2 = (shell) => "schemaVersion" in shell;
+
+// v2 has no HTTP dispatch: commands go over the /ws Effect RPC socket, JSON, one message per frame.
+// One request per socket: send a Request frame, wait for its Exit frame.
+async function t3Rpc(tag, payload) {
+  const { ticket } = await t3Fetch("/api/auth/websocket-ticket", { method: "POST" });
+  const url = new URL("/ws", cfg().get("t3Url").replace(/^http/, "ws"));
+  url.searchParams.set("wsTicket", ticket);
+  url.searchParams.set("orchestrationProtocol", "2");
+  const ws = new WebSocket(url);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => done(reject, new Error(`${tag}: timeout`)), 15000);
+    const done = (fn, v) => (clearTimeout(timer), ws.close(), fn(v));
+    ws.onopen = () => ws.send(JSON.stringify({ _tag: "Request", id: "1", tag, payload, headers: [] }));
+    ws.onerror = (e) => done(reject, new Error(`${tag}: ${e.message ?? "socket error"}`));
+    ws.onclose = (e) => done(reject, new Error(`${tag}: socket closed ${e.code} ${e.reason}`));
+    ws.onmessage = (e) => {
+      for (const m of [].concat(JSON.parse(e.data))) {
+        if (m._tag === "Defect") return done(reject, new Error(`${tag}: ${JSON.stringify(m.defect).slice(0, 300)}`));
+        if (m._tag !== "Exit" || String(m.requestId) !== "1") continue;
+        if (m.exit._tag === "Success") return done(resolve, m.exit.value);
+        return done(reject, new Error(`${tag}: ${JSON.stringify(m.exit.cause).slice(0, 300)}`));
+      }
+    };
+  });
+}
+
+// The T3 thread that called a tool. Stock v1 T3 does not tell an MCP server which thread calls it,
 // so look for the running thread with an unfinished call to this tool in its activity log.
+// The patched v2 T3 sends X-T3-Thread-Id, so this guess is v1 only.
 async function findCallingThread(toolName, args) {
-  const shell = await t3Fetch("/api/orchestration/shell");
+  const shell = await t3Shell();
+  if (isV2(shell)) return null;
   const running = shell.threads.filter((t) => t.session?.activeTurnId);
   // Two threads can call the same tool at once: then match the call's arguments too.
   const argsSnippet = JSON.stringify(args.body ?? "").slice(1, 40);
@@ -89,6 +126,21 @@ async function findCallingThread(toolName, args) {
 }
 
 async function sendToThread(thread, text) {
+  if (thread.v2) {
+    // deliveryIntent "auto" lets the server pick: start now, steer the active run, or queue after it.
+    return t3Rpc("orchestration.dispatchCommand", {
+      type: "message.dispatch",
+      commandId: crypto.randomUUID(),
+      createdBy: "user",
+      creationSource: "web",
+      threadId: thread.id,
+      messageId: crypto.randomUUID(),
+      text,
+      attachments: [],
+      deliveryIntent: "auto",
+      dispatchMode: { type: "start_immediately" },
+    });
+  }
   return t3Fetch("/api/orchestration/dispatch", {
     method: "POST",
     body: JSON.stringify({
@@ -276,9 +328,13 @@ const tools = {
       const id = crypto.randomUUID().slice(0, 8);
       let t3Thread = null;
       try {
-        t3Thread = t3ThreadId
-          ? (await t3Fetch("/api/orchestration/shell")).threads.find((t) => t.id === t3ThreadId) ?? null
-          : await findCallingThread("editor_annotate", { body });
+        if (t3ThreadId) {
+          const shell = await t3Shell();
+          const t = shell.threads.find((t) => t.id === t3ThreadId);
+          t3Thread = t ? { ...t, v2: isV2(shell) } : null;
+        } else {
+          t3Thread = await findCallingThread("editor_annotate", { body });
+        }
       } catch (e) {
         log(`findCallingThread failed: ${e.message}`);
       }
