@@ -288,6 +288,20 @@ function relabel(traceKey) {
   });
 }
 
+const lastStepAt = new Map(); // trace key -> time of its last new step
+
+// Open a step's file beside the chat, select its lines and expand its comment. Keyboard focus stays where it is.
+async function showStep(thread) {
+  thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+  const editor = await vscode.window.showTextDocument(thread.uri, {
+    preview: false,
+    preserveFocus: true,
+    selection: thread.range,
+    viewColumn: vscode.ViewColumn.One,
+  });
+  editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
+}
+
 async function goToStep(fromThread, delta) {
   const entry = threads.get(annotationId(fromThread));
   const ids = traces.get(entry.traceKey);
@@ -369,6 +383,10 @@ const tools = {
       threads.set(id, { thread, t3Thread, path: p, traceKey });
       traces.set(traceKey, [...(traces.get(traceKey) ?? []), id]);
       relabel(traceKey);
+      // Show the first step of each burst of calls; the arrows reach the rest. A burst ends after 20 s.
+      const now = Date.now();
+      if (now - (lastStepAt.get(traceKey) ?? 0) > 20_000) await showStep(thread);
+      lastStepAt.set(traceKey, now);
       log(`annotate ${id} ${p}:${startLine} t3Thread=${traceKey} step=${traces.get(traceKey).length}`);
       return `step ${traces.get(traceKey).length}, annotation ${id} on ${p}:${range.start.line + 1}-${range.end.line + 1}; replies go to T3 thread ${t3Thread?.title ?? "(none found)"}`;
     },
