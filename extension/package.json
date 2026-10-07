@@ -89,11 +89,13 @@
         },
         "drawOut.proxyPort": {
           "type": "number",
-          "default": 3791
+          "default": 0,
+          "description": "0 picks a free port per window."
         },
         "drawOut.mcpPort": {
           "type": "number",
-          "default": 3790
+          "default": 0,
+          "description": "0 picks a free port per window. A patched T3 finds it through the bridge file."
         }
       }
     }

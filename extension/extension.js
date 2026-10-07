@@ -14,6 +14,8 @@ const LOG_FILE = path.join(STATE_DIR, "spike.log");
 const TOKEN_FILE = path.join(STATE_DIR, "t3-token");
 const T3_APP = "/Applications/T3 Code (Alpha).app";
 const T3_BASE_DIR = path.join(os.homedir(), ".t3");
+// A patched T3 reads this folder and attaches our MCP server to chats in our workspace folders.
+const BRIDGE_FILE = path.join(T3_BASE_DIR, "editor-bridges", `draw-out-${process.pid}.json`);
 
 let output;
 function log(msg) {
@@ -99,10 +101,9 @@ async function sendToThread(thread, text) {
 // ---------- Chat panel ----------
 
 let proxyServer;
-function startProxy(rewriteCookies) {
+async function startProxy(rewriteCookies) {
   proxyServer?.close();
   const target = new URL(cfg().get("t3Url"));
-  const port = cfg().get("proxyPort");
   const fixCookie = (c) =>
     rewriteCookies ? c.replace(/;\s*SameSite=Lax/i, "") + "; SameSite=None; Secure" : c;
 
@@ -143,13 +144,15 @@ function startProxy(rewriteCookies) {
     socket.on("error", () => up.destroy());
   });
 
-  proxyServer.listen(port, "127.0.0.1", () => log(`proxy on ${port} -> ${target.host} rewrite=${rewriteCookies}`));
+  await new Promise((r) => proxyServer.listen(cfg().get("proxyPort"), "127.0.0.1", r));
+  const { port } = proxyServer.address();
+  log(`proxy on ${port} -> ${target.host} rewrite=${rewriteCookies}`);
   return `http://127.0.0.1:${port}`;
 }
 
 async function openChat(modeOverride) {
   const mode = typeof modeOverride === "string" ? modeOverride : cfg().get("chatMode");
-  const base = mode === "direct" ? cfg().get("t3Url") : startProxy(mode === "proxy-samesite-none");
+  const base = mode === "direct" ? cfg().get("t3Url") : await startProxy(mode === "proxy-samesite-none");
   let src = base + "/";
   try {
     const { credential } = JSON.parse(await t3Cli(["auth", "pairing", "create", "--ttl", "5m", "--label", "draw-out-panel", "--json"]));
@@ -258,7 +261,7 @@ const tools = {
       },
       required: ["path", "startLine", "body"],
     },
-    async run({ path: p, startLine, endLine, body }) {
+    async run({ path: p, startLine, endLine, body }, { t3ThreadId }) {
       const uri = resolveUri(p);
       const doc = await vscode.workspace.openTextDocument(uri);
       const range = toRange(doc, startLine, endLine);
@@ -268,7 +271,9 @@ const tools = {
       const id = crypto.randomUUID().slice(0, 8);
       let t3Thread = null;
       try {
-        t3Thread = await findCallingThread("editor_annotate", { body });
+        t3Thread = t3ThreadId
+          ? (await t3Fetch("/api/orchestration/shell")).threads.find((t) => t.id === t3ThreadId) ?? null
+          : await findCallingThread("editor_annotate", { body });
       } catch (e) {
         log(`findCallingThread failed: ${e.message}`);
       }
@@ -308,7 +313,6 @@ async function onReply(reply) {
 // ---------- MCP over HTTP (JSON responses, no SSE) ----------
 
 function startMcp() {
-  const port = cfg().get("mcpPort");
   const server = http.createServer(async (req, res) => {
     if (req.method !== "POST" || !req.url.startsWith("/mcp")) return res.writeHead(405).end();
     let raw = "";
@@ -338,9 +342,9 @@ function startMcp() {
         });
       case "tools/call": {
         const tool = tools[msg.params.name];
-        log(`tool ${msg.params.name} ${JSON.stringify(msg.params.arguments)}`);
+        log(`tool ${msg.params.name} thread=${req.headers["x-t3-thread-id"] ?? "?"} ${JSON.stringify(msg.params.arguments)}`);
         try {
-          const text = await tool.run(msg.params.arguments ?? {});
+          const text = await tool.run(msg.params.arguments ?? {}, { t3ThreadId: req.headers["x-t3-thread-id"] });
           return reply({ result: { content: [{ type: "text", text }] } });
         } catch (e) {
           log(`tool error ${e.message}`);
@@ -351,8 +355,30 @@ function startMcp() {
         return reply({ error: { code: -32601, message: `unknown method ${msg.method}` } });
     }
   });
-  server.listen(port, "127.0.0.1", () => log(`mcp on http://127.0.0.1:${port}/mcp`));
+  server.listen(cfg().get("mcpPort"), "127.0.0.1", () => {
+    log(`mcp on http://127.0.0.1:${server.address().port}/mcp`);
+    writeBridge(server);
+  });
   return server;
+}
+
+function writeBridge(server) {
+  const bridge = {
+    version: 1,
+    name: "draw-out",
+    url: `http://127.0.0.1:${server.address().port}/mcp`,
+    pid: process.pid,
+    workspaceFolders: (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
+  };
+  fs.mkdirSync(path.dirname(BRIDGE_FILE), { recursive: true });
+  fs.writeFileSync(BRIDGE_FILE, JSON.stringify(bridge, null, 2));
+  log(`bridge ${BRIDGE_FILE} folders=${bridge.workspaceFolders.join(",")}`);
+}
+
+function removeBridge() {
+  try {
+    fs.unlinkSync(BRIDGE_FILE);
+  } catch {}
 }
 
 function activate(context) {
@@ -363,7 +389,8 @@ function activate(context) {
   context.subscriptions.push(
     output,
     comments,
-    { dispose: () => (mcp.close(), proxyServer?.close()) },
+    { dispose: () => (removeBridge(), mcp.close(), proxyServer?.close()) },
+    vscode.workspace.onDidChangeWorkspaceFolders(() => mcp.listening && writeBridge(mcp)),
     vscode.commands.registerCommand("drawOut.openChat", openChat),
     vscode.commands.registerCommand("drawOut.reply", onReply),
     vscode.commands.registerCommand("drawOut.prevStep", (thread) => goToStep(thread, -1)),
@@ -381,4 +408,6 @@ function activate(context) {
   context.subscriptions.push({ dispose: () => (fs.unwatchFile(autoOpen), fs.unwatchFile(__filename)) });
 }
 
-module.exports = { activate, deactivate() {} };
+process.on("exit", removeBridge);
+
+module.exports = { activate, deactivate: removeBridge };
