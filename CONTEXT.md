@@ -6,9 +6,41 @@ A VS Code extension where agents show Gabriel code while he talks to them in T3,
 
 ### Traces
 
+**Trace**:
+An ordered list of steps that answers one question. It can grow over many turns. A thread can have several traces; the agent adds to the current one unless it starts a new one.
+_Avoid_: tour, flow, walkthrough
+
 **Step**:
 One stop of a trace: a line range in a file, with the agent's note and Gabriel's replies. A step has one note, with a tone (finding, claim, info).
 _Avoid_: card, mark, annotation, comment
+
+**Saved trace**:
+A trace written to `.draw-out/traces/` in the repo, so it outlasts the editor window and the thread.
+_Avoid_: tour file, export
+
+### Code structure
+
+**Block**:
+A named code thing a step can stop at: a handler, route, event, table, or an external service like Zoom. Plain helper functions are not blocks.
+_Avoid_: landmark, node, component, resource
+
+**Legend**:
+A repo's own list of block kinds, and how to find each in its code. AI drafts it; it lives in the repo.
+_Avoid_: schema, ontology
+
+**Extractor**:
+A script that reads a repo's code and finds the blocks of some kinds in its legend.
+_Avoid_: parser, scanner
+
+### Evidence
+
+**Evidence**:
+A pointer to a real source (code lines at a commit, ticket, PR, commit, message, log line, test run) that the UI fetches and renders. The agent never types the quoted text.
+_Avoid_: quote, citation, reference
+
+**Snapshot**:
+The saved text of one piece of evidence, with its source, fetch time and version. Nobody edits it after the fetch.
+_Avoid_: screenshot, cache
 
 ### Servers and windows
 
@@ -27,3 +59,7 @@ _Avoid_: canvas host, client
 **Chat panel**:
 T3's web app inside a VS Code panel, connected to the Draw-out server.
 _Avoid_: chat view, chat sidebar
+
+**Thread history**:
+How a thread evolved over time: messages, tool calls, files touched.
+_Avoid_: thread trace (a trace answers a question about code)
