@@ -391,6 +391,14 @@ function startMcp() {
             protocolVersion: msg.params?.protocolVersion ?? "2025-06-18",
             capabilities: { tools: {} },
             serverInfo: { name: "draw-out", version: "0.0.1" },
+            instructions: [
+              "Draw-out shows code in Gabriel's VS Code window, next to this chat.",
+              "Whenever your answer points at code (how something works, where a bug is, what a change does), show the code there:",
+              "call editor_annotate once per step, in reading order, each on a short line range with a 1-3 sentence note.",
+              "Do this before you answer, and keep the chat answer short: the steps carry the detail. Do not paste the code in the chat.",
+              "The notes of one chat form a trace with numbered steps and arrows between them.",
+              "Use editor_open to show a file without a note. A reply to a note arrives in this chat as a message that quotes the note.",
+            ].join(" "),
           },
         });
       case "ping":
