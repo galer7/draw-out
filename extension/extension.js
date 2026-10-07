@@ -423,7 +423,9 @@ async function focusStep(stepId, preserveFocus = false) {
   const step = store.steps[stepId];
   if (!step) return;
   currentStep = stepId;
+  store.lastStep = { ...store.lastStep, [step.traceId]: stepId };
   if (store.shown !== step.traceId) render(step.traceId);
+  else save();
   for (const [id, t] of shownThreads) {
     t.collapsibleState =
       id === stepId ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
@@ -442,7 +444,9 @@ async function showTrace(traceId) {
   const trace = store.traces[traceId];
   if (!trace) return;
   render(traceId);
-  if (trace.steps.length) await focusStep(trace.steps[0], true);
+  const last = store.lastStep?.[traceId];
+  const stepId = trace.steps.includes(last) ? last : trace.steps[0];
+  if (stepId) await focusStep(stepId, true);
 }
 
 // The step the arrow keys move from: the last one shown if it is in the active editor,
@@ -464,13 +468,15 @@ async function moveStep(fromStepId, delta) {
   if (next) await focusStep(next);
 }
 
-// The chat in the sidebar changed: show that chat's current trace.
-function setActiveThread(threadId) {
+// The chat in the sidebar changed: open its current trace at the step last viewed, or take all notes off
+// the code when the chat has no trace.
+async function setActiveThread(threadId) {
   if (threadId === activeThreadId) return;
   activeThreadId = threadId;
   const traceId = store.current[threadId];
-  if (traceId && store.traces[traceId] && !store.traces[traceId].deletedAt) render(traceId);
-  else traceChanged.fire();
+  log(`chat open ${threadId} trace=${traceId ?? "none"}`);
+  if (traceId && store.traces[traceId] && !store.traces[traceId].deletedAt) await showTrace(traceId);
+  else render(null);
 }
 
 // ---------- Trace view ----------
