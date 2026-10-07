@@ -1,0 +1,41 @@
+{
+  "name": "draw-out-spike",
+  "displayName": "Draw-out (spike)",
+  "description": "PROTOTYPE, throwaway. T3 chat in a panel, and MCP tools that open and annotate files.",
+  "version": "0.0.1",
+  "publisher": "galer7",
+  "private": true,
+  "engines": { "vscode": "^1.100.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "contributes": {
+    "commands": [
+      { "command": "drawOut.openChat", "title": "Draw-out: Open T3 Chat" },
+      { "command": "drawOut.reply", "title": "Send to T3", "enablement": "!commentIsEmpty" }
+    ],
+    "menus": {
+      "comments/commentThread/context": [
+        { "command": "drawOut.reply", "group": "inline", "when": "commentController == draw-out" }
+      ],
+      "commandPalette": [{ "command": "drawOut.reply", "when": "false" }]
+    },
+    "configuration": {
+      "title": "Draw-out",
+      "properties": {
+        "drawOut.t3Url": {
+          "type": "string",
+          "default": "http://127.0.0.1:3773",
+          "description": "T3 server that the chat panel shows and that comment replies go to."
+        },
+        "drawOut.chatMode": {
+          "type": "string",
+          "enum": ["direct", "proxy", "proxy-samesite-none"],
+          "default": "proxy-samesite-none",
+          "description": "direct: frame the T3 server. proxy: frame a logging proxy. proxy-samesite-none: the proxy also rewrites the session cookie to SameSite=None; Secure."
+        },
+        "drawOut.proxyPort": { "type": "number", "default": 3791 },
+        "drawOut.mcpPort": { "type": "number", "default": 3790 }
+      }
+    }
+  }
+}
