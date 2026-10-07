@@ -5,19 +5,69 @@
   "version": "0.0.1",
   "publisher": "galer7",
   "private": true,
-  "engines": { "vscode": "^1.100.0" },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
   "main": "./extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "commands": [
-      { "command": "drawOut.openChat", "title": "Draw-out: Open T3 Chat" },
-      { "command": "drawOut.reply", "title": "Send to T3", "enablement": "!commentIsEmpty" }
+      {
+        "command": "drawOut.openChat",
+        "title": "Draw-out: Open T3 Chat"
+      },
+      {
+        "command": "drawOut.reply",
+        "title": "Send to T3",
+        "enablement": "!commentIsEmpty"
+      },
+      {
+        "command": "drawOut.prevStep",
+        "title": "Previous step",
+        "icon": "$(arrow-left)"
+      },
+      {
+        "command": "drawOut.nextStep",
+        "title": "Next step",
+        "icon": "$(arrow-right)"
+      }
     ],
     "menus": {
       "comments/commentThread/context": [
-        { "command": "drawOut.reply", "group": "inline", "when": "commentController == draw-out" }
+        {
+          "command": "drawOut.reply",
+          "group": "inline",
+          "when": "commentController == draw-out"
+        }
       ],
-      "commandPalette": [{ "command": "drawOut.reply", "when": "false" }]
+      "commandPalette": [
+        {
+          "command": "drawOut.reply",
+          "when": "false"
+        },
+        {
+          "command": "drawOut.prevStep",
+          "when": "false"
+        },
+        {
+          "command": "drawOut.nextStep",
+          "when": "false"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "drawOut.prevStep",
+          "group": "navigation@1",
+          "when": "commentController == draw-out && commentThread =~ /^drawout/ && !(commentThread =~ / first/)"
+        },
+        {
+          "command": "drawOut.nextStep",
+          "group": "navigation@2",
+          "when": "commentController == draw-out && commentThread =~ /^drawout/ && !(commentThread =~ / last/)"
+        }
+      ]
     },
     "configuration": {
       "title": "Draw-out",
@@ -29,12 +79,22 @@
         },
         "drawOut.chatMode": {
           "type": "string",
-          "enum": ["direct", "proxy", "proxy-samesite-none"],
+          "enum": [
+            "direct",
+            "proxy",
+            "proxy-samesite-none"
+          ],
           "default": "proxy-samesite-none",
           "description": "direct: frame the T3 server. proxy: frame a logging proxy. proxy-samesite-none: the proxy also rewrites the session cookie to SameSite=None; Secure."
         },
-        "drawOut.proxyPort": { "type": "number", "default": 3791 },
-        "drawOut.mcpPort": { "type": "number", "default": 3790 }
+        "drawOut.proxyPort": {
+          "type": "number",
+          "default": 3791
+        },
+        "drawOut.mcpPort": {
+          "type": "number",
+          "default": 3790
+        }
       }
     }
   }

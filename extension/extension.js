@@ -52,24 +52,30 @@ async function t3Fetch(pathname, init = {}) {
 
 // The T3 thread that called a tool. Stock T3 does not tell an MCP server which thread calls it,
 // so look for the running thread with an unfinished call to this tool in its activity log.
-async function findCallingThread(toolName) {
+async function findCallingThread(toolName, args) {
   const shell = await t3Fetch("/api/orchestration/shell");
   const running = shell.threads.filter((t) => t.session?.activeTurnId);
+  // Two threads can call the same tool at once: then match the call's arguments too.
+  const argsSnippet = JSON.stringify(args.body ?? "").slice(1, 40);
   for (let attempt = 0; attempt < 5; attempt++) {
     const callers = [];
     for (const t of running) {
       const { activities = [] } = (await t3Fetch(`/api/orchestration/threads/${t.id}`)).thread;
       const done = new Set(activities.filter((a) => a.kind === "tool.completed").map((a) => a.payload?.toolCallId));
-      const open = activities.some(
-        (a) =>
-          a.kind === "tool.started" &&
-          a.payload?.data?.toolName === `mcp__draw-out__${toolName}` &&
-          !done.has(a.payload?.toolCallId),
+      const openIds = activities
+        .filter((a) => a.kind === "tool.started" && a.payload?.data?.toolName === `mcp__draw-out__${toolName}`)
+        .map((a) => a.payload.toolCallId)
+        .filter((id) => !done.has(id));
+      if (!openIds.length) continue;
+      const argsMatch = activities.some(
+        (a) => openIds.includes(a.payload?.toolCallId) && String(a.payload?.detail ?? "").includes(argsSnippet),
       );
-      if (open) callers.push(t);
+      callers.push({ t, argsMatch });
     }
-    if (callers.length === 1) return callers[0];
-    log(`findCallingThread attempt ${attempt}: ${callers.length} candidates of ${running.length} running`);
+    const matched = callers.filter((c) => c.argsMatch);
+    if (callers.length === 1) return callers[0].t;
+    if (matched.length === 1) return matched[0].t;
+    log(`findCallingThread attempt ${attempt}: ${callers.length} candidates, ${matched.length} match args, ${running.length} running`);
     await new Promise((r) => setTimeout(r, 300));
   }
   return null;
@@ -180,7 +186,34 @@ function toRange(doc, startLine, endLine) {
 }
 
 let comments;
-const threads = new Map(); // id -> { thread, t3Thread }
+const threads = new Map(); // annotation id -> { thread, t3Thread, path, traceKey }
+const traces = new Map(); // T3 thread id (or "none") -> annotation ids, in step order
+
+// contextValue carries the annotation id, plus "first"/"last" so the arrow buttons can hide.
+const annotationId = (thread) => thread.contextValue.split(" ")[1];
+
+function relabel(traceKey) {
+  const ids = traces.get(traceKey);
+  ids.forEach((id, i) => {
+    const { thread, t3Thread } = threads.get(id);
+    thread.label = `Step ${i + 1}/${ids.length}` + (t3Thread ? ` · ${t3Thread.title}` : "");
+    thread.contextValue = `drawout ${id}${i === 0 ? " first" : ""}${i === ids.length - 1 ? " last" : ""}`;
+  });
+}
+
+async function goToStep(fromThread, delta) {
+  const entry = threads.get(annotationId(fromThread));
+  const ids = traces.get(entry.traceKey);
+  const next = ids[ids.indexOf(annotationId(fromThread)) + delta];
+  if (!next) return;
+  for (const id of ids) {
+    threads.get(id).thread.collapsibleState =
+      id === next ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
+  }
+  const { thread } = threads.get(next);
+  const editor = await vscode.window.showTextDocument(thread.uri, { preview: false, selection: thread.range });
+  editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
+}
 
 const tools = {
   editor_open: {
@@ -231,19 +264,20 @@ const tools = {
       const range = toRange(doc, startLine, endLine);
       const thread = comments.createCommentThread(uri, range, [comment(body, "Agent")]);
       thread.canReply = true;
-      thread.label = "Draw-out";
       thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
       const id = crypto.randomUUID().slice(0, 8);
-      thread.contextValue = id;
       let t3Thread = null;
       try {
-        t3Thread = await findCallingThread("editor_annotate");
+        t3Thread = await findCallingThread("editor_annotate", { body });
       } catch (e) {
         log(`findCallingThread failed: ${e.message}`);
       }
-      threads.set(id, { thread, t3Thread, path: p });
-      log(`annotate ${id} ${p}:${startLine} t3Thread=${t3Thread?.id ?? "none"}`);
-      return `annotation ${id} on ${p}:${range.start.line + 1}-${range.end.line + 1}; replies go to T3 thread ${t3Thread?.title ?? "(none found)"}`;
+      const traceKey = t3Thread?.id ?? "none";
+      threads.set(id, { thread, t3Thread, path: p, traceKey });
+      traces.set(traceKey, [...(traces.get(traceKey) ?? []), id]);
+      relabel(traceKey);
+      log(`annotate ${id} ${p}:${startLine} t3Thread=${traceKey} step=${traces.get(traceKey).length}`);
+      return `step ${traces.get(traceKey).length}, annotation ${id} on ${p}:${range.start.line + 1}-${range.end.line + 1}; replies go to T3 thread ${t3Thread?.title ?? "(none found)"}`;
     },
   },
 };
@@ -253,7 +287,7 @@ function comment(body, author) {
 }
 
 async function onReply(reply) {
-  const entry = threads.get(reply.thread.contextValue);
+  const entry = threads.get(annotationId(reply.thread));
   reply.thread.comments = [...reply.thread.comments, comment(reply.text, "Gabriel")];
   if (!entry?.t3Thread) {
     vscode.window.showWarningMessage("Draw-out: this comment thread has no T3 thread.");
@@ -261,10 +295,10 @@ async function onReply(reply) {
   }
   const r = entry.thread.range;
   const quote = reply.thread.comments.slice(-2, -1)[0]?.body.value ?? "";
-  const text = `Reply on ${entry.path}:${r.start.line + 1}-${r.end.line + 1} (annotation ${reply.thread.contextValue})\n\n> ${quote.split("\n").join("\n> ")}\n\n${reply.text}`;
+  const text = `Reply on ${entry.path}:${r.start.line + 1}-${r.end.line + 1} (annotation ${annotationId(reply.thread)})\n\n> ${quote.split("\n").join("\n> ")}\n\n${reply.text}`;
   try {
     await sendToThread(entry.t3Thread, text);
-    log(`reply ${reply.thread.contextValue} sent to ${entry.t3Thread.id}`);
+    log(`reply ${annotationId(reply.thread)} sent to ${entry.t3Thread.id}`);
   } catch (e) {
     log(`reply failed: ${e.message}`);
     vscode.window.showErrorMessage(`Draw-out: reply failed: ${e.message}`);
@@ -332,6 +366,8 @@ function activate(context) {
     { dispose: () => (mcp.close(), proxyServer?.close()) },
     vscode.commands.registerCommand("drawOut.openChat", openChat),
     vscode.commands.registerCommand("drawOut.reply", onReply),
+    vscode.commands.registerCommand("drawOut.prevStep", (thread) => goToStep(thread, -1)),
+    vscode.commands.registerCommand("drawOut.nextStep", (thread) => goToStep(thread, 1)),
   );
   log("activated");
   // Spike only: lets an agent open the panel without a click. The file holds the chat mode.
