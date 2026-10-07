@@ -275,7 +275,28 @@ async function workspaceProject() {
   return projectId;
 }
 
+// The chat lives in a webview view in the secondary sidebar, so code always opens in the editor area.
+let chatView;
+const chatViewProvider = {
+  resolveWebviewView(view) {
+    chatView = view;
+    view.webview.options = { enableScripts: true };
+    view.webview.onDidReceiveMessage(async (m) => {
+      if (m.type === "drawout-copy") await vscode.env.clipboard.writeText(m.text);
+      if (m.type === "drawout-paste-request") {
+        view.webview.postMessage({ type: "drawout-paste", text: await vscode.env.clipboard.readText() });
+      }
+    });
+    loadChat(view.webview);
+  },
+};
+
 async function openChat(modeOverride) {
+  if (chatView && typeof modeOverride === "string") await loadChat(chatView.webview, modeOverride);
+  await vscode.commands.executeCommand("drawOut.chat.focus");
+}
+
+async function loadChat(webview, modeOverride) {
   const mode = typeof modeOverride === "string" ? modeOverride : cfg().get("chatMode");
   const base = mode === "direct" ? cfg().get("t3Url") : await startProxy(mode === "proxy-samesite-none");
   let query = "";
@@ -294,18 +315,8 @@ async function openChat(modeOverride) {
   }
   log(`openChat mode=${mode} base=${base}${query}`);
 
-  const panel = vscode.window.createWebviewPanel("drawOut.chat", "T3", vscode.ViewColumn.Beside, {
-    enableScripts: true,
-    retainContextWhenHidden: true,
-  });
-  panel.webview.onDidReceiveMessage(async (m) => {
-    if (m.type === "drawout-copy") await vscode.env.clipboard.writeText(m.text);
-    if (m.type === "drawout-paste-request") {
-      panel.webview.postMessage({ type: "drawout-paste", text: await vscode.env.clipboard.readText() });
-    }
-  });
   const nonce = crypto.randomUUID();
-  panel.webview.html = `<!doctype html><html><head>
+  webview.html = `<!doctype html><html><head>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:* http://localhost:*; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>html,body,iframe{margin:0;padding:0;border:0;width:100%;height:100vh;overflow:hidden}</style>
 </head><body><iframe src="${src}" allow="clipboard-read; clipboard-write"></iframe>
@@ -348,38 +359,74 @@ const annotationId = (thread) => thread.contextValue.split(" ")[1];
 function relabel(traceKey) {
   const ids = traces.get(traceKey);
   ids.forEach((id, i) => {
-    const { thread, t3Thread } = threads.get(id);
+    const { thread, t3Thread, body } = threads.get(id);
     thread.label = `Step ${i + 1}/${ids.length}` + (t3Thread ? ` · ${t3Thread.title}` : "");
     thread.contextValue = `drawout ${id}${i === 0 ? " first" : ""}${i === ids.length - 1 ? " last" : ""}`;
+    // VS Code's Comments panel groups notes by file; the number keeps the order readable there.
+    thread.comments = [comment(`**${i + 1}/${ids.length}** · ${body}`, "Agent"), ...thread.comments.slice(1)];
   });
+  traceChanged.fire();
 }
+
+// A step's short title: the note's first bold phrase, else its first sentence.
+function stepTitle(body) {
+  const bold = body.match(/\*\*(.+?)\*\*/);
+  const text = (bold ? bold[1] : body.split(/(?<=[.!?])\s/)[0]).replace(/[`*_]/g, "").trim();
+  return text.length > 70 ? text.slice(0, 69) + "…" : text;
+}
+
+// The Trace view: each thread's steps in order. The Comments panel cannot be sorted by step.
+const traceChanged = new vscode.EventEmitter();
+const traceTree = {
+  onDidChangeTreeData: traceChanged.event,
+  getChildren(el) {
+    if (!el) return [...traces.keys()].reverse().map((key) => ({ key }));
+    if (!el.id) return traces.get(el.key).map((id, i) => ({ id, i }));
+    return [];
+  },
+  getTreeItem(el) {
+    if (!el.id) {
+      const ids = traces.get(el.key);
+      const item = new vscode.TreeItem(threads.get(ids[0]).t3Thread?.title ?? "Trace", vscode.TreeItemCollapsibleState.Expanded);
+      item.description = `${ids.length} steps`;
+      return item;
+    }
+    const { thread, body } = threads.get(el.id);
+    const item = new vscode.TreeItem(`${el.i + 1}. ${stepTitle(body)}`);
+    item.description = `${path.basename(thread.uri.fsPath)}:${thread.range.start.line + 1}`;
+    item.tooltip = new vscode.MarkdownString(body);
+    item.command = { command: "drawOut.showStep", title: "Show step", arguments: [el.id] };
+    return item;
+  },
+};
 
 const lastStepAt = new Map(); // trace key -> time of its last new step
 
-// Open a step's file beside the chat, select its lines and expand its comment. Keyboard focus stays where it is.
-async function showStep(thread) {
+// Open a step's file in the main editor group, select its lines and expand its note.
+async function showStep(thread, preserveFocus = true) {
   thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
   const editor = await vscode.window.showTextDocument(thread.uri, {
     preview: false,
-    preserveFocus: true,
+    preserveFocus,
     selection: thread.range,
     viewColumn: vscode.ViewColumn.One,
   });
   editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
 }
 
-async function goToStep(fromThread, delta) {
-  const entry = threads.get(annotationId(fromThread));
-  const ids = traces.get(entry.traceKey);
-  const next = ids[ids.indexOf(annotationId(fromThread)) + delta];
-  if (!next) return;
-  for (const id of ids) {
-    threads.get(id).thread.collapsibleState =
-      id === next ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
+// Show one step and fold the other notes of its trace.
+async function focusStep(id) {
+  const ids = traces.get(threads.get(id).traceKey);
+  for (const other of ids) {
+    if (other !== id) threads.get(other).thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
   }
-  const { thread } = threads.get(next);
-  const editor = await vscode.window.showTextDocument(thread.uri, { preview: false, selection: thread.range });
-  editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
+  await showStep(threads.get(id).thread, false);
+}
+
+async function goToStep(fromThread, delta) {
+  const ids = traces.get(threads.get(annotationId(fromThread)).traceKey);
+  const next = ids[ids.indexOf(annotationId(fromThread)) + delta];
+  if (next) await focusStep(next);
 }
 
 const tools = {
@@ -446,7 +493,7 @@ const tools = {
         log(`findCallingThread failed: ${e.message}`);
       }
       const traceKey = t3Thread?.id ?? "none";
-      threads.set(id, { thread, t3Thread, path: p, traceKey });
+      threads.set(id, { thread, t3Thread, path: p, traceKey, body });
       traces.set(traceKey, [...(traces.get(traceKey) ?? []), id]);
       relabel(traceKey);
       // Show the first step of each burst of calls; the arrows reach the rest. A burst ends after 20 s.
@@ -578,7 +625,13 @@ function activate(context) {
     comments,
     { dispose: () => (removeBridge(), mcp.close(), proxyServer?.close()) },
     vscode.workspace.onDidChangeWorkspaceFolders(() => mcp.listening && writeBridge(mcp)),
+    vscode.window.registerWebviewViewProvider("drawOut.chat", chatViewProvider, {
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+    vscode.window.registerTreeDataProvider("drawOut.trace", traceTree),
     vscode.commands.registerCommand("drawOut.openChat", openChat),
+    vscode.commands.registerCommand("drawOut.reloadChat", () => chatView && loadChat(chatView.webview)),
+    vscode.commands.registerCommand("drawOut.showStep", focusStep),
     vscode.commands.registerCommand("drawOut.reply", onReply),
     vscode.commands.registerCommand("drawOut.prevStep", (thread) => goToStep(thread, -1)),
     vscode.commands.registerCommand("drawOut.nextStep", (thread) => goToStep(thread, 1)),
