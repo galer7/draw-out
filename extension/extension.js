@@ -11,11 +11,7 @@ const { execFile } = require("node:child_process");
 
 const STATE_DIR = path.join(os.homedir(), ".draw-out");
 const LOG_FILE = path.join(STATE_DIR, "spike.log");
-const TOKEN_FILE = path.join(STATE_DIR, "t3-token");
 const T3_APP = "/Applications/T3 Code (Alpha).app";
-const T3_BASE_DIR = path.join(os.homedir(), ".t3");
-// A patched T3 reads this folder and attaches our MCP server to chats in our workspace folders.
-const BRIDGE_FILE = path.join(T3_BASE_DIR, "editor-bridges", `draw-out-${process.pid}.json`);
 
 let output;
 function log(msg) {
@@ -27,14 +23,23 @@ function log(msg) {
 }
 
 const cfg = () => vscode.workspace.getConfiguration("drawOut");
+const t3BaseDir = () => cfg().get("t3BaseDir").replace(/^~/, os.homedir());
+// One bearer token per T3 server, named by its port: ~/.draw-out/t3-token-3773.
+const tokenFile = () => path.join(STATE_DIR, `t3-token-${new URL(cfg().get("t3Url")).port}`);
+// A patched T3 reads this folder and attaches our MCP server to chats in our workspace folders.
+let bridgeFile;
 
 // ---------- T3 ----------
 
 function t3Cli(args) {
+  // drawOut.t3Cli runs another T3 build, e.g. ["node", "/path/to/t3code/apps/server/src/bin.ts"].
+  const [cmd, ...pre] = cfg().get("t3Cli").length
+    ? cfg().get("t3Cli")
+    : [`${T3_APP}/Contents/MacOS/T3 Code (Alpha)`, `${T3_APP}/Contents/Resources/app.asar/apps/server/dist/bin.mjs`];
   return new Promise((resolve, reject) => {
     execFile(
-      `${T3_APP}/Contents/MacOS/T3 Code (Alpha)`,
-      [`${T3_APP}/Contents/Resources/app.asar/apps/server/dist/bin.mjs`, ...args, "--base-dir", T3_BASE_DIR],
+      cmd,
+      [...pre, ...args, "--base-dir", t3BaseDir()],
       { env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" } },
       (err, stdout, stderr) => (err ? reject(new Error(stderr || err.message)) : resolve(stdout)),
     );
@@ -42,7 +47,7 @@ function t3Cli(args) {
 }
 
 async function t3Fetch(pathname, init = {}) {
-  const token = fs.readFileSync(TOKEN_FILE, "utf8").trim();
+  const token = fs.readFileSync(tokenFile(), "utf8").trim();
   const res = await fetch(cfg().get("t3Url") + pathname, {
     ...init,
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...init.headers },
@@ -370,14 +375,16 @@ function writeBridge(server) {
     pid: process.pid,
     workspaceFolders: (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath),
   };
-  fs.mkdirSync(path.dirname(BRIDGE_FILE), { recursive: true });
-  fs.writeFileSync(BRIDGE_FILE, JSON.stringify(bridge, null, 2));
-  log(`bridge ${BRIDGE_FILE} folders=${bridge.workspaceFolders.join(",")}`);
+  removeBridge();
+  bridgeFile = path.join(t3BaseDir(), "editor-bridges", `draw-out-${process.pid}.json`);
+  fs.mkdirSync(path.dirname(bridgeFile), { recursive: true });
+  fs.writeFileSync(bridgeFile, JSON.stringify(bridge, null, 2));
+  log(`bridge ${bridgeFile} folders=${bridge.workspaceFolders.join(",")}`);
 }
 
 function removeBridge() {
   try {
-    fs.unlinkSync(BRIDGE_FILE);
+    if (bridgeFile) fs.unlinkSync(bridgeFile);
   } catch {}
 }
 

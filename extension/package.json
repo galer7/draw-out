@@ -77,6 +77,19 @@
           "default": "http://127.0.0.1:3773",
           "description": "T3 server that the chat panel shows and that comment replies go to."
         },
+        "drawOut.t3BaseDir": {
+          "type": "string",
+          "default": "~/.t3",
+          "description": "Data folder of that T3 server. The bridge file goes in its editor-bridges folder."
+        },
+        "drawOut.t3Cli": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Command that runs that T3 server CLI. Empty: the T3 Code (Alpha) app."
+        },
         "drawOut.chatMode": {
           "type": "string",
           "enum": [
