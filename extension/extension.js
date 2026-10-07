@@ -182,6 +182,12 @@ const INJECT_JS = `(() => {
     const at = Date.now();
     setTimeout(() => { if (lastPaste < at) parent.postMessage({ type: "drawout-paste-request" }, "*"); }, 80);
   }, true);
+  let lastPath = "";
+  setInterval(() => {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    parent.postMessage({ type: "drawout-location", path: lastPath }, "*");
+  }, 500);
   log("inject loaded");
 })();`;
 async function startProxy(rewriteCookies) {
@@ -283,6 +289,8 @@ const chatViewProvider = {
     view.webview.options = { enableScripts: true };
     view.webview.onDidReceiveMessage(async (m) => {
       if (m.type === "drawout-copy") await vscode.env.clipboard.writeText(m.text);
+      // A chat's address is /<environmentId>/<threadId>.
+      if (m.type === "drawout-location") setActiveThread(m.path.split("/").filter(Boolean)[1] ?? null);
       if (m.type === "drawout-paste-request") {
         view.webview.postMessage({ type: "drawout-paste", text: await vscode.env.clipboard.readText() });
       }
@@ -330,6 +338,234 @@ async function loadChat(webview, modeOverride) {
 </script></body></html>`;
 }
 
+// ---------- Traces ----------
+//
+// A trace belongs to one T3 thread (a chat) and holds ordered steps. All traces live in VS Code's storage for
+// this folder, so a reload or a restart keeps them. The notes of one trace at a time sit on the code: the
+// "shown" trace. The agent deletes a trace softly: it moves to "Deleted", and only Gabriel empties that.
+//
+// store = {
+//   traces: { [traceId]: { id, title, thread: { id, title, v2, runtimeMode, interactionMode }, createdAt, deletedAt, steps: [stepId] } },
+//   steps:  { [stepId]: { id, traceId, uri, startLine, endLine, body, replies: [{ author, text }] } },  // lines 0-based
+//   current: { [threadId]: traceId },  // the trace the agent adds to, per chat
+//   shown: traceId | null,
+// }
+
+const STORE_KEY = "drawOut.traces.v1";
+let comments;
+let workspaceState;
+let store = { traces: {}, steps: {}, current: {}, shown: null };
+let activeThreadId = null; // the chat open in the sidebar, from the T3 page's address
+let currentStep = null;
+const shownThreads = new Map(); // stepId -> CommentThread, for the shown trace only
+const lastStepAt = new Map(); // traceId -> time of its last new step
+
+const newId = (prefix) => `${prefix}-${crypto.randomUUID().slice(0, 6)}`;
+const save = () => workspaceState.update(STORE_KEY, store);
+const liveTraces = (threadId) =>
+  Object.values(store.traces).filter((t) => t.thread.id === threadId && !t.deletedAt);
+
+function loadStore(state) {
+  workspaceState = state;
+  store = { traces: {}, steps: {}, current: {}, shown: null, ...state.get(STORE_KEY) };
+}
+
+function comment(body, author) {
+  return { body: new vscode.MarkdownString(body), mode: vscode.CommentMode.Preview, author: { name: author } };
+}
+
+// A step's short title: the note's first bold phrase, else its first sentence.
+function stepTitle(body) {
+  const bold = body.match(/\*\*(.+?)\*\*/);
+  const text = (bold ? bold[1] : body.split(/(?<=[.!?])\s/)[0]).replace(/[`*_]/g, "").trim();
+  return text.length > 70 ? text.slice(0, 69) + "…" : text;
+}
+
+// A heading reads bigger than the body text; VS Code has no font size setting for comments.
+// The number also keeps the order readable in the Comments panel, which groups notes by file.
+function noteMarkdown(step, i, n) {
+  const rest = step.body.replace(/^\s*\*\*(.+?)\*\*\s*/, "");
+  return `### ${i + 1}/${n} · ${stepTitle(step.body)}\n\n${rest}`;
+}
+
+// Put the notes of one trace on the code, and take the others off.
+function render(traceId = store.shown) {
+  for (const t of shownThreads.values()) t.dispose();
+  shownThreads.clear();
+  store.shown = traceId ?? null;
+  const trace = store.traces[store.shown];
+  if (trace && !trace.deletedAt) {
+    const n = trace.steps.length;
+    trace.steps.forEach((stepId, i) => {
+      const step = store.steps[stepId];
+      const range = new vscode.Range(step.startLine, 0, step.endLine, Number.MAX_SAFE_INTEGER);
+      const thread = comments.createCommentThread(vscode.Uri.parse(step.uri), range, [
+        comment(noteMarkdown(step, i, n), "Agent"),
+        ...step.replies.map((r) => comment(r.text, r.author)),
+      ]);
+      thread.canReply = true;
+      thread.label = `Step ${i + 1}/${n} · ${trace.title}`;
+      thread.contextValue = `drawout ${stepId}${i === 0 ? " first" : ""}${i === n - 1 ? " last" : ""}`;
+      thread.collapsibleState =
+        stepId === currentStep ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
+      shownThreads.set(stepId, thread);
+    });
+  }
+  save();
+  traceChanged.fire();
+  log(`render trace=${store.shown} notes=${shownThreads.size} traces=${Object.keys(store.traces).length}`);
+}
+
+const stepIdOf = (commentThread) => commentThread.contextValue.split(" ")[1];
+
+// Open a step's file in the main editor group, select its lines and expand its note; fold the others.
+async function focusStep(stepId, preserveFocus = false) {
+  const step = store.steps[stepId];
+  if (!step) return;
+  currentStep = stepId;
+  if (store.shown !== step.traceId) render(step.traceId);
+  for (const [id, t] of shownThreads) {
+    t.collapsibleState =
+      id === stepId ? vscode.CommentThreadCollapsibleState.Expanded : vscode.CommentThreadCollapsibleState.Collapsed;
+  }
+  const range = shownThreads.get(stepId).range;
+  const editor = await vscode.window.showTextDocument(vscode.Uri.parse(step.uri), {
+    preview: false,
+    preserveFocus,
+    selection: range,
+    viewColumn: vscode.ViewColumn.One,
+  });
+  editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+}
+
+async function showTrace(traceId) {
+  const trace = store.traces[traceId];
+  if (!trace) return;
+  render(traceId);
+  if (trace.steps.length) await focusStep(trace.steps[0], true);
+}
+
+// The step the arrow keys move from: the last one shown if it is in the active editor,
+// else the step under the cursor, else the last one shown.
+function stepAtCursor() {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return currentStep;
+  const here = [...shownThreads].filter(([, t]) => t.uri.toString() === editor.document.uri.toString());
+  if (currentStep && here.some(([id]) => id === currentStep)) return currentStep;
+  const line = editor.selection.active.line;
+  return here.find(([, t]) => t.range.start.line <= line && line <= t.range.end.line)?.[0] ?? currentStep;
+}
+
+async function moveStep(fromStepId, delta) {
+  const step = store.steps[fromStepId];
+  if (!step) return;
+  const ids = store.traces[step.traceId].steps;
+  const next = ids[ids.indexOf(fromStepId) + delta];
+  if (next) await focusStep(next);
+}
+
+// The chat in the sidebar changed: show that chat's current trace.
+function setActiveThread(threadId) {
+  if (threadId === activeThreadId) return;
+  activeThreadId = threadId;
+  const traceId = store.current[threadId];
+  if (traceId && store.traces[traceId] && !store.traces[traceId].deletedAt) render(traceId);
+  else traceChanged.fire();
+}
+
+// ---------- Trace view ----------
+
+const traceChanged = new vscode.EventEmitter();
+let traceView;
+const traceTree = {
+  onDidChangeTreeData: traceChanged.event,
+  getChildren(el) {
+    if (el?.kind === "trace") return store.traces[el.id].steps.map((id, i) => ({ kind: "step", id, i }));
+    if (el?.kind === "deleted") return el.ids.map((id) => ({ kind: "trace", id }));
+    if (el?.kind === "chat") return liveTraces(el.id).reverse().map((t) => ({ kind: "trace", id: t.id }));
+    if (el) return [];
+    // Root: the open chat's traces, or every chat when the open chat has none.
+    const all = Object.values(store.traces);
+    const chatIds = activeThreadId && all.some((t) => t.thread.id === activeThreadId) ? [activeThreadId] : [...new Set(all.map((t) => t.thread.id))];
+    const roots =
+      chatIds.length === 1
+        ? liveTraces(chatIds[0]).reverse().map((t) => ({ kind: "trace", id: t.id }))
+        : chatIds.reverse().map((id) => ({ kind: "chat", id }));
+    const deleted = all.filter((t) => t.deletedAt && chatIds.includes(t.thread.id)).map((t) => t.id);
+    if (deleted.length) roots.push({ kind: "deleted", ids: deleted });
+    if (traceView) {
+      const chat = chatIds.length === 1 && all.find((t) => t.thread.id === chatIds[0])?.thread.title;
+      traceView.description = chat || "";
+    }
+    return roots;
+  },
+  getTreeItem(el) {
+    const Collapsed = vscode.TreeItemCollapsibleState;
+    if (el.kind === "chat") {
+      const any = Object.values(store.traces).find((t) => t.thread.id === el.id);
+      const item = new vscode.TreeItem(any.thread.title, Collapsed.Expanded);
+      item.iconPath = new vscode.ThemeIcon("comment-discussion");
+      return item;
+    }
+    if (el.kind === "deleted") {
+      const item = new vscode.TreeItem("Deleted", Collapsed.Collapsed);
+      item.iconPath = new vscode.ThemeIcon("trash");
+      item.contextValue = "drawoutDeleted";
+      return item;
+    }
+    if (el.kind === "trace") {
+      const t = store.traces[el.id];
+      const shown = store.shown === t.id;
+      const item = new vscode.TreeItem(t.title, shown ? Collapsed.Expanded : Collapsed.Collapsed);
+      item.id = t.id;
+      item.description = `${t.steps.length} steps${shown ? " · shown" : ""}${store.current[t.thread.id] === t.id ? " · current" : ""}`;
+      item.iconPath = new vscode.ThemeIcon(t.deletedAt ? "circle-slash" : shown ? "eye" : "list-ordered");
+      item.contextValue = t.deletedAt ? "drawoutTraceDeleted" : "drawoutTrace";
+      if (!t.deletedAt) item.command = { command: "drawOut.showTrace", title: "Show trace", arguments: [t.id] };
+      return item;
+    }
+    const step = store.steps[el.id];
+    const item = new vscode.TreeItem(`${el.i + 1}. ${stepTitle(step.body)}`);
+    item.id = el.id;
+    item.description = `${path.basename(vscode.Uri.parse(step.uri).fsPath)}:${step.startLine + 1}`;
+    item.tooltip = new vscode.MarkdownString(step.body);
+    item.command = { command: "drawOut.showStep", title: "Show step", arguments: [el.id] };
+    return item;
+  },
+};
+
+// Gabriel's own actions on traces, from the Trace view's context menu.
+async function renameTrace(el) {
+  const t = store.traces[el?.id];
+  const title = t && (await vscode.window.showInputBox({ prompt: "Trace title", value: t.title }));
+  if (!title) return;
+  t.title = title;
+  render();
+}
+function deleteTrace(el) {
+  const t = store.traces[el?.id];
+  if (!t) return;
+  t.deletedAt = Date.now();
+  if (store.current[t.thread.id] === t.id) delete store.current[t.thread.id];
+  render(store.shown === t.id ? null : store.shown);
+}
+function restoreTrace(el) {
+  const t = store.traces[el?.id];
+  if (!t) return;
+  t.deletedAt = null;
+  render();
+}
+async function emptyDeleted(el) {
+  const ids = el?.ids ?? [];
+  const pick = await vscode.window.showWarningMessage(`Delete ${ids.length} traces for good?`, { modal: true }, "Delete");
+  if (pick !== "Delete") return;
+  for (const id of ids) {
+    for (const stepId of store.traces[id].steps) delete store.steps[stepId];
+    delete store.traces[id];
+  }
+  render();
+}
+
 // ---------- Editor tools ----------
 
 // A relative path is relative to the calling thread's folder (X-T3-Thread-Cwd), which can be a T3 worktree
@@ -342,143 +578,79 @@ function resolveUri(p, cwd) {
   return vscode.Uri.joinPath(root.uri, p);
 }
 
-// 1-based inclusive lines in, a vscode Range out.
-function toRange(doc, startLine, endLine) {
-  const s = Math.max(1, startLine ?? 1) - 1;
-  const e = Math.min(doc.lineCount, endLine ?? startLine ?? 1) - 1;
-  return new vscode.Range(s, 0, e, doc.lineAt(e).text.length);
+// 1-based inclusive lines in, 0-based lines out, clamped to the file.
+async function lineRange(uri, startLine, endLine) {
+  const doc = await vscode.workspace.openTextDocument(uri);
+  const start = Math.min(doc.lineCount, Math.max(1, startLine ?? 1)) - 1;
+  const end = Math.min(doc.lineCount, Math.max(start + 1, endLine ?? startLine ?? 1)) - 1;
+  return { doc, start, end };
 }
 
-let comments;
-const threads = new Map(); // annotation id -> { thread, t3Thread, path, traceKey }
-const traces = new Map(); // T3 thread id (or "none") -> annotation ids, in step order
-
-// contextValue carries the annotation id, plus "first"/"last" so the arrow buttons can hide.
-const annotationId = (thread) => thread.contextValue.split(" ")[1];
-
-function relabel(traceKey) {
-  const ids = traces.get(traceKey);
-  ids.forEach((id, i) => {
-    const { thread, t3Thread, body } = threads.get(id);
-    thread.label = `Step ${i + 1}/${ids.length}` + (t3Thread ? ` · ${t3Thread.title}` : "");
-    thread.contextValue = `drawout ${id}${i === 0 ? " first" : ""}${i === ids.length - 1 ? " last" : ""}`;
-    // A heading reads bigger than the body text; VS Code has no font size setting for comments.
-    // The number also keeps the order readable in the Comments panel, which groups notes by file.
-    const rest = body.replace(/^\s*\*\*(.+?)\*\*\s*/, "");
-    const note = `### ${i + 1}/${ids.length} · ${stepTitle(body)}\n\n${rest === body ? body : rest}`;
-    thread.comments = [comment(note, "Agent"), ...thread.comments.slice(1)];
-  });
-  traceChanged.fire();
-}
-
-// A step's short title: the note's first bold phrase, else its first sentence.
-function stepTitle(body) {
-  const bold = body.match(/\*\*(.+?)\*\*/);
-  const text = (bold ? bold[1] : body.split(/(?<=[.!?])\s/)[0]).replace(/[`*_]/g, "").trim();
-  return text.length > 70 ? text.slice(0, 69) + "…" : text;
-}
-
-// The Trace view: each thread's steps in order. The Comments panel cannot be sorted by step.
-const traceChanged = new vscode.EventEmitter();
-const traceTree = {
-  onDidChangeTreeData: traceChanged.event,
-  getChildren(el) {
-    if (!el) return [...traces.keys()].reverse().map((key) => ({ key }));
-    if (!el.id) return traces.get(el.key).map((id, i) => ({ id, i }));
-    return [];
-  },
-  getTreeItem(el) {
-    if (!el.id) {
-      const ids = traces.get(el.key);
-      const item = new vscode.TreeItem(threads.get(ids[0]).t3Thread?.title ?? "Trace", vscode.TreeItemCollapsibleState.Expanded);
-      item.description = `${ids.length} steps`;
-      return item;
+// The calling chat. The patched T3 names it in X-T3-Thread-Id; stock T3 needs the guess.
+async function callingThread({ t3ThreadId }, toolName, args) {
+  let t = null;
+  try {
+    if (t3ThreadId) {
+      const shell = await t3Shell();
+      const found = shell.threads.find((x) => x.id === t3ThreadId);
+      t = found ? { ...found, v2: isV2(shell) } : { id: t3ThreadId, title: "Chat", v2: true };
+    } else {
+      t = await findCallingThread(toolName, args);
     }
-    const { thread, body } = threads.get(el.id);
-    const item = new vscode.TreeItem(`${el.i + 1}. ${stepTitle(body)}`);
-    item.description = `${path.basename(thread.uri.fsPath)}:${thread.range.start.line + 1}`;
-    item.tooltip = new vscode.MarkdownString(body);
-    item.command = { command: "drawOut.showStep", title: "Show step", arguments: [el.id] };
-    return item;
-  },
-};
-
-const lastStepAt = new Map(); // trace key -> time of its last new step
-
-// Open a step's file in the main editor group, select its lines and expand its note.
-async function showStep(thread, preserveFocus = true) {
-  thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-  const editor = await vscode.window.showTextDocument(thread.uri, {
-    preview: false,
-    preserveFocus,
-    selection: thread.range,
-    viewColumn: vscode.ViewColumn.One,
-  });
-  editor.revealRange(thread.range, vscode.TextEditorRevealType.InCenter);
-}
-
-// Show one step and fold the other notes of its trace.
-let currentStep = null;
-
-// The step the arrow keys move from: the last one shown if it is in the active editor,
-// else the step under the cursor, else the last one shown.
-function stepAtCursor() {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) return currentStep;
-  const here = [...threads].filter(([, e]) => e.thread.uri.toString() === editor.document.uri.toString());
-  if (currentStep && here.some(([id]) => id === currentStep)) return currentStep;
-  const line = editor.selection.active.line;
-  return here.find(([, e]) => e.thread.range.start.line <= line && line <= e.thread.range.end.line)?.[0] ?? currentStep;
-}
-
-async function stepKey(delta) {
-  const from = stepAtCursor();
-  if (!from) return;
-  const ids = traces.get(threads.get(from).traceKey);
-  const next = ids[ids.indexOf(from) + delta];
-  if (next) await focusStep(next);
-}
-
-async function focusStep(id) {
-  currentStep = id;
-  const ids = traces.get(threads.get(id).traceKey);
-  for (const other of ids) {
-    if (other !== id) threads.get(other).thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
+  } catch (e) {
+    log(`callingThread failed: ${e.message}`);
   }
-  await showStep(threads.get(id).thread, false);
+  const thread = t ?? { id: "none", title: "No chat" };
+  return { id: thread.id, title: thread.title, v2: !!thread.v2, runtimeMode: thread.runtimeMode, interactionMode: thread.interactionMode };
 }
 
-async function goToStep(fromThread, delta) {
-  const ids = traces.get(threads.get(annotationId(fromThread)).traceKey);
-  const next = ids[ids.indexOf(annotationId(fromThread)) + delta];
-  if (next) await focusStep(next);
+function createTrace(thread, title) {
+  const trace = { id: newId("t"), title, thread, createdAt: Date.now(), deletedAt: null, steps: [] };
+  store.traces[trace.id] = trace;
+  store.current[thread.id] = trace.id;
+  return trace;
 }
+
+// A trace of the calling chat, by id. The agent cannot touch other chats' traces.
+function ownTrace(thread, traceId) {
+  const t = store.traces[traceId];
+  if (!t || t.thread.id !== thread.id) throw new Error(`no trace ${traceId} in this chat; call trace_list`);
+  return t;
+}
+function ownStep(thread, stepId) {
+  const s = store.steps[stepId];
+  if (!s) throw new Error(`no step ${stepId}; call trace_list`);
+  ownTrace(thread, s.traceId);
+  return s;
+}
+
+const describeTrace = (t) =>
+  `${t.id} "${t.title}"${t.deletedAt ? " (deleted)" : ""}: ` +
+  (t.steps.map((id, i) => `${i + 1}. ${id} ${stepTitle(store.steps[id].body)}`).join("; ") || "no steps");
+
+const lineProps = {
+  path: { type: "string", description: "Absolute, or relative to this chat's folder." },
+  startLine: { type: "number", description: "1-based." },
+  endLine: { type: "number", description: "1-based, inclusive." },
+};
 
 const tools = {
   editor_open: {
-    description: "Open a file as an editor tab, select a line range and scroll it to the center.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Absolute, or relative to the workspace root." },
-        startLine: { type: "number", description: "1-based." },
-        endLine: { type: "number", description: "1-based, inclusive." },
-      },
-      required: ["path"],
-    },
-    async run({ path: p, startLine, endLine }, { cwd }) {
-      const doc = await vscode.workspace.openTextDocument(resolveUri(p, cwd));
-      const range = toRange(doc, startLine, endLine);
-      const editor = await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true, selection: range });
+    description: "Open a file as an editor tab, select a line range and scroll it to the center. No note.",
+    inputSchema: { type: "object", properties: lineProps, required: ["path"] },
+    async run({ path: p, startLine, endLine }, ctx) {
+      const { doc, start, end } = await lineRange(resolveUri(p, ctx.cwd), startLine, endLine);
+      const range = new vscode.Range(start, 0, end, doc.lineAt(end).text.length);
+      const editor = await vscode.window.showTextDocument(doc, { preview: false, preserveFocus: true, selection: range, viewColumn: vscode.ViewColumn.One });
       editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-      return `opened ${p}:${range.start.line + 1}-${range.end.line + 1}`;
+      return `opened ${p}:${start + 1}-${end + 1}`;
     },
   },
   editor_focus: {
     description: "Bring one open file to the front of its editor group. Other tabs stay open behind it.",
-    inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-    async run({ path: p }, { cwd }) {
-      const uri = resolveUri(p, cwd);
+    inputSchema: { type: "object", properties: { path: lineProps.path }, required: ["path"] },
+    async run({ path: p }, ctx) {
+      const uri = resolveUri(p, ctx.cwd);
       const tab = vscode.window.tabGroups.all.flatMap((g) => g.tabs).find((t) => t.input?.uri?.fsPath === uri.fsPath);
       await vscode.window.showTextDocument(uri, { preview: false, preserveFocus: true, viewColumn: tab?.group.viewColumn });
       return `focused ${p}${tab ? "" : " (was not open)"}`;
@@ -486,71 +658,144 @@ const tools = {
   },
   editor_annotate: {
     description:
-      "Add a comment thread on a line range. Gabriel can reply in the thread; the reply arrives in this chat as a new message.",
+      "Add a step to a trace: a note on a line range. It goes to this chat's current trace, or to traceId. " +
+      "Gabriel can reply on the note; the reply arrives in this chat as a message. Returns the step id.",
     inputSchema: {
       type: "object",
-      properties: {
-        path: { type: "string" },
-        startLine: { type: "number" },
-        endLine: { type: "number" },
-        body: { type: "string", description: "Markdown." },
-      },
+      properties: { ...lineProps, body: { type: "string", description: "Markdown. Start with a bold title." }, traceId: { type: "string" } },
       required: ["path", "startLine", "body"],
     },
-    async run({ path: p, startLine, endLine, body }, { t3ThreadId, cwd }) {
-      const uri = resolveUri(p, cwd);
-      const doc = await vscode.workspace.openTextDocument(uri);
-      const range = toRange(doc, startLine, endLine);
-      const thread = comments.createCommentThread(uri, range, [comment(body, "Agent")]);
-      thread.canReply = true;
-      thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-      const id = crypto.randomUUID().slice(0, 8);
-      let t3Thread = null;
-      try {
-        if (t3ThreadId) {
-          const shell = await t3Shell();
-          const t = shell.threads.find((t) => t.id === t3ThreadId);
-          t3Thread = t ? { ...t, v2: isV2(shell) } : null;
-        } else {
-          t3Thread = await findCallingThread("editor_annotate", { body });
-        }
-      } catch (e) {
-        log(`findCallingThread failed: ${e.message}`);
-      }
-      const traceKey = t3Thread?.id ?? "none";
-      threads.set(id, { thread, t3Thread, path: p, traceKey, body });
-      traces.set(traceKey, [...(traces.get(traceKey) ?? []), id]);
-      relabel(traceKey);
+    async run({ path: p, startLine, endLine, body, traceId }, ctx) {
+      const uri = resolveUri(p, ctx.cwd);
+      const { start, end } = await lineRange(uri, startLine, endLine);
+      const thread = await callingThread(ctx, "editor_annotate", { body });
+      let trace = traceId ? ownTrace(thread, traceId) : store.traces[store.current[thread.id]];
+      if (!trace || trace.deletedAt) trace = createTrace(thread, `${thread.title} #${liveTraces(thread.id).length + 1}`);
+      const step = { id: newId("s"), traceId: trace.id, uri: uri.toString(), startLine: start, endLine: end, body, replies: [] };
+      store.steps[step.id] = step;
+      trace.steps.push(step.id);
       // Show the first step of each burst of calls; the arrows reach the rest. A burst ends after 20 s.
       const now = Date.now();
-      if (now - (lastStepAt.get(traceKey) ?? 0) > 20_000) {
-        currentStep = id;
-        await showStep(thread);
+      const burstStart = now - (lastStepAt.get(trace.id) ?? 0) > 20_000;
+      lastStepAt.set(trace.id, now);
+      if (burstStart) currentStep = step.id;
+      render(trace.id);
+      if (burstStart) await focusStep(step.id, true);
+      log(`annotate ${step.id} ${p}:${start + 1} trace=${trace.id} chat=${thread.id} step=${trace.steps.length}`);
+      return `step ${trace.steps.length} of trace ${trace.id} "${trace.title}", step id ${step.id}, on ${p}:${start + 1}-${end + 1}`;
+    },
+  },
+  trace_create: {
+    description:
+      "Start a new trace in this chat and make it current: later editor_annotate calls add to it. " +
+      "Start one for each new question; keep adding to the current one while the question stays the same.",
+    inputSchema: { type: "object", properties: { title: { type: "string", description: "2-6 words." } }, required: ["title"] },
+    async run({ title }, ctx) {
+      const trace = createTrace(await callingThread(ctx, "trace_create", {}), title);
+      render(trace.id);
+      return `trace ${trace.id} "${title}" is current`;
+    },
+  },
+  trace_list: {
+    description: "List this chat's traces with their step ids, the current one first. Deleted traces are marked.",
+    inputSchema: { type: "object", properties: {} },
+    async run(_, ctx) {
+      const thread = await callingThread(ctx, "trace_list", {});
+      const mine = Object.values(store.traces).filter((t) => t.thread.id === thread.id);
+      if (!mine.length) return "no traces in this chat";
+      const cur = store.current[thread.id];
+      return mine.sort((a, b) => (a.id === cur ? -1 : b.id === cur ? 1 : 0)).map((t) => (t.id === cur ? "current: " : "") + describeTrace(t)).join("\n");
+    },
+  },
+  trace_select: {
+    description: "Make one of this chat's traces current, and show it in the editor.",
+    inputSchema: { type: "object", properties: { traceId: { type: "string" } }, required: ["traceId"] },
+    async run({ traceId }, ctx) {
+      const trace = ownTrace(await callingThread(ctx, "trace_select", {}), traceId);
+      trace.deletedAt = null;
+      store.current[trace.thread.id] = trace.id;
+      await showTrace(trace.id);
+      return `trace ${trace.id} "${trace.title}" is current`;
+    },
+  },
+  trace_rename: {
+    description: "Rename one of this chat's traces.",
+    inputSchema: { type: "object", properties: { traceId: { type: "string" }, title: { type: "string" } }, required: ["traceId", "title"] },
+    async run({ traceId, title }, ctx) {
+      ownTrace(await callingThread(ctx, "trace_rename", {}), traceId).title = title;
+      render();
+      return `renamed ${traceId}`;
+    },
+  },
+  trace_delete: {
+    description: "Delete one of this chat's traces. It moves to Deleted in Gabriel's Trace view, where he can restore it.",
+    inputSchema: { type: "object", properties: { traceId: { type: "string" } }, required: ["traceId"] },
+    async run({ traceId }, ctx) {
+      deleteTrace({ id: ownTrace(await callingThread(ctx, "trace_delete", {}), traceId).id });
+      return `deleted ${traceId}; Gabriel can restore it`;
+    },
+  },
+  step_edit: {
+    description: "Change a step's note or its lines. Give only what changes.",
+    inputSchema: { type: "object", properties: { stepId: { type: "string" }, body: { type: "string" }, ...lineProps }, required: ["stepId"] },
+    async run({ stepId, body, path: p, startLine, endLine }, ctx) {
+      const step = ownStep(await callingThread(ctx, "step_edit", {}), stepId);
+      if (body) step.body = body;
+      if (p || startLine) {
+        const uri = p ? resolveUri(p, ctx.cwd) : vscode.Uri.parse(step.uri);
+        const { start, end } = await lineRange(uri, startLine ?? step.startLine + 1, endLine ?? (startLine ? undefined : step.endLine + 1));
+        Object.assign(step, { uri: uri.toString(), startLine: start, endLine: end });
       }
-      lastStepAt.set(traceKey, now);
-      log(`annotate ${id} ${p}:${startLine} t3Thread=${traceKey} step=${traces.get(traceKey).length}`);
-      return `step ${traces.get(traceKey).length}, annotation ${id} on ${p}:${range.start.line + 1}-${range.end.line + 1}; replies go to T3 thread ${t3Thread?.title ?? "(none found)"}`;
+      render(store.shown === step.traceId ? step.traceId : store.shown);
+      return `edited ${stepId}`;
+    },
+  },
+  step_move: {
+    description: "Move a step to another position in its trace (1-based).",
+    inputSchema: { type: "object", properties: { stepId: { type: "string" }, position: { type: "number" } }, required: ["stepId", "position"] },
+    async run({ stepId, position }, ctx) {
+      const step = ownStep(await callingThread(ctx, "step_move", {}), stepId);
+      const ids = store.traces[step.traceId].steps;
+      ids.splice(ids.indexOf(stepId), 1);
+      ids.splice(Math.max(0, Math.min(ids.length, position - 1)), 0, stepId);
+      render(store.shown === step.traceId ? step.traceId : store.shown);
+      return `moved ${stepId} to ${ids.indexOf(stepId) + 1}`;
+    },
+  },
+  step_delete: {
+    description: "Remove a step from its trace.",
+    inputSchema: { type: "object", properties: { stepId: { type: "string" } }, required: ["stepId"] },
+    async run({ stepId }, ctx) {
+      const step = ownStep(await callingThread(ctx, "step_delete", {}), stepId);
+      const ids = store.traces[step.traceId].steps;
+      ids.splice(ids.indexOf(stepId), 1);
+      delete store.steps[stepId];
+      render(store.shown === step.traceId ? step.traceId : store.shown);
+      return `removed ${stepId}`;
     },
   },
 };
 
-function comment(body, author) {
-  return { body: new vscode.MarkdownString(body), mode: vscode.CommentMode.Preview, author: { name: author } };
-}
-
 async function onReply(reply) {
-  const entry = threads.get(annotationId(reply.thread));
+  const stepId = stepIdOf(reply.thread);
+  const step = store.steps[stepId];
+  if (!step) return;
+  const trace = store.traces[step.traceId];
+  step.replies.push({ author: "Gabriel", text: reply.text });
   reply.thread.comments = [...reply.thread.comments, comment(reply.text, "Gabriel")];
-  if (!entry?.t3Thread) {
-    vscode.window.showWarningMessage("Draw-out: this comment thread has no T3 thread.");
+  save();
+  if (trace.thread.id === "none") {
+    vscode.window.showWarningMessage("Draw-out: this trace has no T3 chat.");
     return;
   }
-  const r = entry.thread.range;
-  const quote = reply.thread.comments.slice(-2, -1)[0]?.body.value ?? "";
-  const text = `Reply on ${entry.path}:${r.start.line + 1}-${r.end.line + 1} (annotation ${annotationId(reply.thread)})\n\n> ${quote.split("\n").join("\n> ")}\n\n${reply.text}`;
+  const i = trace.steps.indexOf(stepId);
+  const file = vscode.workspace.asRelativePath(vscode.Uri.parse(step.uri));
+  const text =
+    `Reply on step ${i + 1} (${stepId}) of trace "${trace.title}" (${trace.id}), ${file}:${step.startLine + 1}-${step.endLine + 1}\n\n` +
+    `> ${step.body.split("\n").join("\n> ")}\n\n${reply.text}`;
   try {
-    await sendToThread(entry.t3Thread, text);
-    log(`reply ${annotationId(reply.thread)} sent to ${entry.t3Thread.id}`);
+    await sendToThread(trace.thread, text);
+    log(`reply ${stepId} sent to ${trace.thread.id}`);
   } catch (e) {
     log(`reply failed: ${e.message}`);
     vscode.window.showErrorMessage(`Draw-out: reply failed: ${e.message}`);
@@ -582,7 +827,9 @@ function startMcp() {
               "Whenever your answer points at code (how something works, where a bug is, what a change does), show the code there:",
               "call editor_annotate once per step, in reading order, each on a short line range with a 1-3 sentence note.",
               "Do this before you answer, and keep the chat answer short: the steps carry the detail. Do not paste the code in the chat.",
-              "The notes of one chat form a trace with numbered steps and arrows between them.",
+              "Steps form traces: numbered steps with arrows between them. A chat can have several traces.",
+              "Call trace_create with a short title when a new question starts; keep adding to the current trace while the question stays the same.",
+              "Use trace_list to see this chat's traces and step ids, and step_edit, step_move, step_delete, trace_rename, trace_select and trace_delete to change them.",
               "Use editor_open to show a file without a note. A reply to a note arrives in this chat as a message that quotes the note.",
               "These editor steps come first, even when you also draw an overview with html_render: the page shows the shape, the steps show the real code.",
               "Never answer a question about this repo's code with html_render alone.",
@@ -651,6 +898,9 @@ function activate(context) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   output = vscode.window.createOutputChannel("Draw-out");
   comments = vscode.comments.createCommentController("draw-out", "Draw-out");
+  loadStore(context.workspaceState);
+  traceView = vscode.window.createTreeView("drawOut.trace", { treeDataProvider: traceTree });
+  render();
   const mcp = startMcp();
   context.subscriptions.push(
     output,
@@ -660,15 +910,20 @@ function activate(context) {
     vscode.window.registerWebviewViewProvider("drawOut.chat", chatViewProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
-    vscode.window.registerTreeDataProvider("drawOut.trace", traceTree),
+    traceView,
+    vscode.commands.registerCommand("drawOut.showTrace", showTrace),
+    vscode.commands.registerCommand("drawOut.renameTrace", renameTrace),
+    vscode.commands.registerCommand("drawOut.deleteTrace", deleteTrace),
+    vscode.commands.registerCommand("drawOut.restoreTrace", restoreTrace),
+    vscode.commands.registerCommand("drawOut.emptyDeleted", emptyDeleted),
     vscode.commands.registerCommand("drawOut.openChat", openChat),
     vscode.commands.registerCommand("drawOut.reloadChat", () => chatView && loadChat(chatView.webview)),
     vscode.commands.registerCommand("drawOut.showStep", focusStep),
-    vscode.commands.registerCommand("drawOut.stepLeft", () => stepKey(-1)),
-    vscode.commands.registerCommand("drawOut.stepRight", () => stepKey(1)),
+    vscode.commands.registerCommand("drawOut.stepLeft", () => moveStep(stepAtCursor(), -1)),
+    vscode.commands.registerCommand("drawOut.stepRight", () => moveStep(stepAtCursor(), 1)),
     vscode.commands.registerCommand("drawOut.reply", onReply),
-    vscode.commands.registerCommand("drawOut.prevStep", (thread) => goToStep(thread, -1)),
-    vscode.commands.registerCommand("drawOut.nextStep", (thread) => goToStep(thread, 1)),
+    vscode.commands.registerCommand("drawOut.prevStep", (thread) => moveStep(stepIdOf(thread), -1)),
+    vscode.commands.registerCommand("drawOut.nextStep", (thread) => moveStep(stepIdOf(thread), 1)),
   );
   log("activated");
   // Spike only: lets an agent open the panel without a click. The file holds the chat mode.

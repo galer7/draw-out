@@ -48,6 +48,30 @@
       {
         "command": "drawOut.stepRight",
         "title": "Draw-out: Next Step"
+      },
+      {
+        "command": "drawOut.showTrace",
+        "title": "Show trace"
+      },
+      {
+        "command": "drawOut.renameTrace",
+        "title": "Rename",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "drawOut.deleteTrace",
+        "title": "Delete",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "drawOut.restoreTrace",
+        "title": "Restore",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "drawOut.emptyDeleted",
+        "title": "Delete for good",
+        "icon": "$(clear-all)"
       }
     ],
     "menus": {
@@ -74,6 +98,26 @@
         {
           "command": "drawOut.showStep",
           "when": "false"
+        },
+        {
+          "command": "drawOut.showTrace",
+          "when": "false"
+        },
+        {
+          "command": "drawOut.renameTrace",
+          "when": "false"
+        },
+        {
+          "command": "drawOut.deleteTrace",
+          "when": "false"
+        },
+        {
+          "command": "drawOut.restoreTrace",
+          "when": "false"
+        },
+        {
+          "command": "drawOut.emptyDeleted",
+          "when": "false"
         }
       ],
       "comments/commentThread/title": [
@@ -86,6 +130,28 @@
           "command": "drawOut.nextStep",
           "group": "navigation@2",
           "when": "commentController == draw-out && commentThread =~ /^drawout/ && !(commentThread =~ / last/)"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "drawOut.renameTrace",
+          "when": "view == drawOut.trace && viewItem == drawoutTrace",
+          "group": "inline@1"
+        },
+        {
+          "command": "drawOut.deleteTrace",
+          "when": "view == drawOut.trace && viewItem == drawoutTrace",
+          "group": "inline@2"
+        },
+        {
+          "command": "drawOut.restoreTrace",
+          "when": "view == drawOut.trace && viewItem == drawoutTraceDeleted",
+          "group": "inline"
+        },
+        {
+          "command": "drawOut.emptyDeleted",
+          "when": "view == drawOut.trace && viewItem == drawoutDeleted",
+          "group": "inline"
         }
       ]
     },
