@@ -74,12 +74,12 @@
       "properties": {
         "drawOut.t3Url": {
           "type": "string",
-          "default": "http://127.0.0.1:3773",
+          "default": "http://127.0.0.1:3780",
           "description": "T3 server that the chat panel shows and that comment replies go to."
         },
         "drawOut.t3BaseDir": {
           "type": "string",
-          "default": "~/.t3",
+          "default": "~/.t3-drawout",
           "description": "Data folder of that T3 server. The bridge file goes in its editor-bridges folder."
         },
         "drawOut.t3Cli": {
@@ -87,8 +87,11 @@
           "items": {
             "type": "string"
           },
-          "default": [],
-          "description": "Command that runs that T3 server CLI. Empty: the T3 Code (Alpha) app."
+          "default": [
+            "/Users/gabrielgaler/.local/share/mise/installs/node/24.13.1/bin/node",
+            "/Users/gabrielgaler/p/_forks/t3code/apps/server/src/bin.ts"
+          ],
+          "description": "Command that runs that T3 server CLI. Default: the patched T3 in ~/p/_forks/t3code. Empty: the T3 Code (Alpha) app."
         },
         "drawOut.chatMode": {
           "type": "string",
