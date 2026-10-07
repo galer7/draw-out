@@ -40,6 +40,14 @@
       {
         "command": "drawOut.showStep",
         "title": "Show step"
+      },
+      {
+        "command": "drawOut.stepLeft",
+        "title": "Draw-out: Previous Step"
+      },
+      {
+        "command": "drawOut.stepRight",
+        "title": "Draw-out: Next Step"
       }
     ],
     "menus": {
@@ -150,6 +158,18 @@
           "name": "Draw-out Trace"
         }
       ]
-    }
+    },
+    "keybindings": [
+      {
+        "command": "drawOut.stepLeft",
+        "key": "left",
+        "when": "commentFocused && !commentEditorFocused"
+      },
+      {
+        "command": "drawOut.stepRight",
+        "key": "right",
+        "when": "commentFocused && !commentEditorFocused"
+      }
+    ]
   }
 }

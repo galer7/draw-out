@@ -362,8 +362,11 @@ function relabel(traceKey) {
     const { thread, t3Thread, body } = threads.get(id);
     thread.label = `Step ${i + 1}/${ids.length}` + (t3Thread ? ` · ${t3Thread.title}` : "");
     thread.contextValue = `drawout ${id}${i === 0 ? " first" : ""}${i === ids.length - 1 ? " last" : ""}`;
-    // VS Code's Comments panel groups notes by file; the number keeps the order readable there.
-    thread.comments = [comment(`**${i + 1}/${ids.length}** · ${body}`, "Agent"), ...thread.comments.slice(1)];
+    // A heading reads bigger than the body text; VS Code has no font size setting for comments.
+    // The number also keeps the order readable in the Comments panel, which groups notes by file.
+    const rest = body.replace(/^\s*\*\*(.+?)\*\*\s*/, "");
+    const note = `### ${i + 1}/${ids.length} · ${stepTitle(body)}\n\n${rest === body ? body : rest}`;
+    thread.comments = [comment(note, "Agent"), ...thread.comments.slice(1)];
   });
   traceChanged.fire();
 }
@@ -415,7 +418,29 @@ async function showStep(thread, preserveFocus = true) {
 }
 
 // Show one step and fold the other notes of its trace.
+let currentStep = null;
+
+// The step the arrow keys move from: the last one shown if it is in the active editor,
+// else the step under the cursor, else the last one shown.
+function stepAtCursor() {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) return currentStep;
+  const here = [...threads].filter(([, e]) => e.thread.uri.toString() === editor.document.uri.toString());
+  if (currentStep && here.some(([id]) => id === currentStep)) return currentStep;
+  const line = editor.selection.active.line;
+  return here.find(([, e]) => e.thread.range.start.line <= line && line <= e.thread.range.end.line)?.[0] ?? currentStep;
+}
+
+async function stepKey(delta) {
+  const from = stepAtCursor();
+  if (!from) return;
+  const ids = traces.get(threads.get(from).traceKey);
+  const next = ids[ids.indexOf(from) + delta];
+  if (next) await focusStep(next);
+}
+
 async function focusStep(id) {
+  currentStep = id;
   const ids = traces.get(threads.get(id).traceKey);
   for (const other of ids) {
     if (other !== id) threads.get(other).thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
@@ -498,7 +523,10 @@ const tools = {
       relabel(traceKey);
       // Show the first step of each burst of calls; the arrows reach the rest. A burst ends after 20 s.
       const now = Date.now();
-      if (now - (lastStepAt.get(traceKey) ?? 0) > 20_000) await showStep(thread);
+      if (now - (lastStepAt.get(traceKey) ?? 0) > 20_000) {
+        currentStep = id;
+        await showStep(thread);
+      }
       lastStepAt.set(traceKey, now);
       log(`annotate ${id} ${p}:${startLine} t3Thread=${traceKey} step=${traces.get(traceKey).length}`);
       return `step ${traces.get(traceKey).length}, annotation ${id} on ${p}:${range.start.line + 1}-${range.end.line + 1}; replies go to T3 thread ${t3Thread?.title ?? "(none found)"}`;
@@ -558,6 +586,10 @@ function startMcp() {
               "Use editor_open to show a file without a note. A reply to a note arrives in this chat as a message that quotes the note.",
               "These editor steps come first, even when you also draw an overview with html_render: the page shows the shape, the steps show the real code.",
               "Never answer a question about this repo's code with html_render alone.",
+              "Write each note like this: start with a bold title of 2-5 words, then 1-3 sentences.",
+              "Give a little context first: what this step does in the flow, before the detail.",
+              "Use ASD-STE100 Simplified Technical English: one idea per sentence, 20 words at most, active voice, present tense.",
+              "Use the words of the repo's CONTEXT.md when it has one. Put names from the code in `backticks`, and bold the one key term of the note.",
             ].join(" "),
           },
         });
@@ -632,6 +664,8 @@ function activate(context) {
     vscode.commands.registerCommand("drawOut.openChat", openChat),
     vscode.commands.registerCommand("drawOut.reloadChat", () => chatView && loadChat(chatView.webview)),
     vscode.commands.registerCommand("drawOut.showStep", focusStep),
+    vscode.commands.registerCommand("drawOut.stepLeft", () => stepKey(-1)),
+    vscode.commands.registerCommand("drawOut.stepRight", () => stepKey(1)),
     vscode.commands.registerCommand("drawOut.reply", onReply),
     vscode.commands.registerCommand("drawOut.prevStep", (thread) => goToStep(thread, -1)),
     vscode.commands.registerCommand("drawOut.nextStep", (thread) => goToStep(thread, 1)),
