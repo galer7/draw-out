@@ -207,17 +207,41 @@ async function startProxy(rewriteCookies) {
   return `http://127.0.0.1:${port}`;
 }
 
+// The T3 project for this window's first folder. Adds it when missing, with chats in the folder itself:
+// a chat in a T3 worktree runs in a folder no editor window has open, so it would get no editor tools.
+async function workspaceProject() {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) return null;
+  const shell = await t3Shell();
+  const found = shell.projects.find((p) => p.workspaceRoot === root);
+  if (found) return found.id;
+  if (!isV2(shell)) return null;
+  const projectId = crypto.randomUUID();
+  const mutate = (body) => t3Fetch("/api/projects/mutate", { method: "POST", body: JSON.stringify({ commandId: crypto.randomUUID(), projectId, ...body }) });
+  await mutate({ type: "project.create", title: path.basename(root), workspaceRoot: root });
+  await mutate({ type: "project.update", defaultThreadEnvMode: "local" });
+  log(`added project ${path.basename(root)} ${projectId}`);
+  return projectId;
+}
+
 async function openChat(modeOverride) {
   const mode = typeof modeOverride === "string" ? modeOverride : cfg().get("chatMode");
   const base = mode === "direct" ? cfg().get("t3Url") : await startProxy(mode === "proxy-samesite-none");
-  let src = base + "/";
+  let query = "";
+  try {
+    const projectId = await workspaceProject();
+    if (projectId) query = `?project=${projectId}`;
+  } catch (e) {
+    log(`workspace project failed: ${e.message}`);
+  }
+  let src = `${base}/${query}`;
   try {
     const { credential } = JSON.parse(await t3Cli(["auth", "pairing", "create", "--ttl", "5m", "--label", "draw-out-panel", "--json"]));
-    src = `${base}/pair#token=${credential}`;
+    src = `${base}/pair${query}#token=${credential}`;
   } catch (e) {
     log(`pairing failed: ${e.message}`);
   }
-  log(`openChat mode=${mode} base=${base}`);
+  log(`openChat mode=${mode} base=${base}${query}`);
 
   const panel = vscode.window.createWebviewPanel("drawOut.chat", "T3", vscode.ViewColumn.Beside, {
     enableScripts: true,
