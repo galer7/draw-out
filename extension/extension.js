@@ -158,6 +158,34 @@ async function sendToThread(thread, text) {
 // ---------- Chat panel ----------
 
 let proxyServer;
+
+// Runs inside the framed T3 page. VS Code's Copy and Paste commands act on the panel's own page, not on a
+// page framed inside it, so the panel passes the clipboard through postMessage. Each path logs to spike.log.
+const INJECT_JS = `(() => {
+  const log = (m) => fetch("/__drawout/log?m=" + encodeURIComponent(m)).catch(() => {});
+  let lastPaste = 0;
+  const insert = (text, via) => {
+    if (Date.now() - lastPaste < 300) return;
+    lastPaste = Date.now();
+    log("paste via " + via + " ok=" + document.execCommand("insertText", false, text));
+  };
+  document.addEventListener("paste", () => { lastPaste = Date.now(); log("native paste"); }, true);
+  window.addEventListener("message", (e) => {
+    if (e.source === parent && e.data && e.data.type === "drawout-paste") insert(e.data.text, "panel");
+  });
+  document.addEventListener("keydown", (e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.key.toLowerCase() !== "v") return;
+    const at = Date.now();
+    setTimeout(async () => {
+      if (lastPaste >= at) return;
+      try { insert(await navigator.clipboard.readText(), "clipboard-api"); }
+      catch (err) { log("clipboard-api failed: " + err.message); }
+    }, 80);
+  }, true);
+  document.addEventListener("selectionchange", () =>
+    parent.postMessage({ type: "drawout-selection", text: String(getSelection()) }, "*"));
+  log("inject loaded");
+})();`;
 async function startProxy(rewriteCookies) {
   proxyServer?.close();
   const target = new URL(cfg().get("t3Url"));
@@ -165,16 +193,41 @@ async function startProxy(rewriteCookies) {
     rewriteCookies ? c.replace(/;\s*SameSite=Lax/i, "") + "; SameSite=None; Secure" : c;
 
   proxyServer = http.createServer((req, res) => {
+    if (req.url === "/__drawout/inject.js") {
+      return res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-store" }).end(INJECT_JS);
+    }
+    if (req.url.startsWith("/__drawout/log?")) {
+      log(`panel ${new URL(req.url, "http://x").searchParams.get("m")}`);
+      return res.writeHead(204).end();
+    }
     const hasCookie = /t3_session_/.test(req.headers.cookie || "");
     const upstream = http.request(
-      { host: target.hostname, port: target.port, path: req.url, method: req.method, headers: { ...req.headers, host: target.host } },
+      {
+        host: target.hostname,
+        port: target.port,
+        path: req.url,
+        method: req.method,
+        // Uncompressed, so the HTML page can take the injected script.
+        headers: { ...req.headers, host: target.host, "accept-encoding": "identity" },
+      },
       (up) => {
         const headers = { ...up.headers };
         if (headers["set-cookie"]) headers["set-cookie"] = headers["set-cookie"].map(fixCookie);
         if (req.url.startsWith("/api/auth") || req.url === "/" || req.url.startsWith("/pair"))
           log(`proxy ${req.method} ${req.url} cookie=${hasCookie} -> ${up.statusCode}${headers["set-cookie"] ? " set-cookie" : ""}`);
-        res.writeHead(up.statusCode, headers);
-        up.pipe(res);
+        if (!String(headers["content-type"]).startsWith("text/html")) {
+          res.writeHead(up.statusCode, headers);
+          return up.pipe(res);
+        }
+        let html = "";
+        up.setEncoding("utf8");
+        up.on("data", (c) => (html += c));
+        up.on("end", () => {
+          delete headers["content-length"];
+          delete headers.etag;
+          res.writeHead(up.statusCode, headers);
+          res.end(html.replace(/<head[^>]*>/i, (m) => `${m}<script src="/__drawout/inject.js"></script>`));
+        });
       },
     );
     upstream.on("error", (e) => {
@@ -247,10 +300,30 @@ async function openChat(modeOverride) {
     enableScripts: true,
     retainContextWhenHidden: true,
   });
+  const nonce = crypto.randomUUID();
   panel.webview.html = `<!doctype html><html><head>
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:* http://localhost:*; style-src 'unsafe-inline';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:* http://localhost:*; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>html,body,iframe{margin:0;padding:0;border:0;width:100%;height:100vh;overflow:hidden}</style>
-</head><body><iframe src="${src}" allow="clipboard-read; clipboard-write"></iframe></body></html>`;
+</head><body><iframe src="${src}" allow="clipboard-read; clipboard-write"></iframe>
+<script nonce="${nonce}">
+  const frame = document.querySelector("iframe");
+  let selection = "";
+  window.addEventListener("message", (e) => {
+    if (e.source === frame.contentWindow && e.data?.type === "drawout-selection") selection = e.data.text;
+  });
+  document.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text/plain");
+    if (text) frame.contentWindow.postMessage({ type: "drawout-paste", text }, "*");
+    e.preventDefault();
+  });
+  for (const kind of ["copy", "cut"]) {
+    document.addEventListener(kind, (e) => {
+      if (!selection) return;
+      e.clipboardData.setData("text/plain", selection);
+      e.preventDefault();
+    });
+  }
+</script></body></html>`;
 }
 
 // ---------- Editor tools ----------
