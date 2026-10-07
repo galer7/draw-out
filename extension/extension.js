@@ -159,31 +159,29 @@ async function sendToThread(thread, text) {
 
 let proxyServer;
 
-// Runs inside the framed T3 page. VS Code's Copy and Paste commands act on the panel's own page, not on a
-// page framed inside it, so the panel passes the clipboard through postMessage. Each path logs to spike.log.
+// Runs inside the framed T3 page. In the panel, the browser fires no paste event in this page and denies it
+// the clipboard, but the extension can read and write the clipboard. So ⌘V asks the extension for the text,
+// and ⌘C hands it the selection: page -> panel page -> extension, and back. Each step logs to spike.log.
 const INJECT_JS = `(() => {
   const log = (m) => fetch("/__drawout/log?m=" + encodeURIComponent(m)).catch(() => {});
   let lastPaste = 0;
-  const insert = (text, via) => {
-    if (Date.now() - lastPaste < 300) return;
-    lastPaste = Date.now();
-    log("paste via " + via + " ok=" + document.execCommand("insertText", false, text));
-  };
   document.addEventListener("paste", () => { lastPaste = Date.now(); log("native paste"); }, true);
   window.addEventListener("message", (e) => {
-    if (e.source === parent && e.data && e.data.type === "drawout-paste") insert(e.data.text, "panel");
+    if (e.source !== parent || !e.data || e.data.type !== "drawout-paste") return;
+    log("paste ok=" + document.execCommand("insertText", false, e.data.text));
   });
   document.addEventListener("keydown", (e) => {
-    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.key.toLowerCase() !== "v") return;
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    const key = e.key.toLowerCase();
+    if (key === "c" || key === "x") {
+      const text = String(getSelection());
+      if (text) parent.postMessage({ type: "drawout-copy", text }, "*");
+      return;
+    }
+    if (key !== "v") return;
     const at = Date.now();
-    setTimeout(async () => {
-      if (lastPaste >= at) return;
-      try { insert(await navigator.clipboard.readText(), "clipboard-api"); }
-      catch (err) { log("clipboard-api failed: " + err.message); }
-    }, 80);
+    setTimeout(() => { if (lastPaste < at) parent.postMessage({ type: "drawout-paste-request" }, "*"); }, 80);
   }, true);
-  document.addEventListener("selectionchange", () =>
-    parent.postMessage({ type: "drawout-selection", text: String(getSelection()) }, "*"));
   log("inject loaded");
 })();`;
 async function startProxy(rewriteCookies) {
@@ -300,29 +298,24 @@ async function openChat(modeOverride) {
     enableScripts: true,
     retainContextWhenHidden: true,
   });
+  panel.webview.onDidReceiveMessage(async (m) => {
+    if (m.type === "drawout-copy") await vscode.env.clipboard.writeText(m.text);
+    if (m.type === "drawout-paste-request") {
+      panel.webview.postMessage({ type: "drawout-paste", text: await vscode.env.clipboard.readText() });
+    }
+  });
   const nonce = crypto.randomUUID();
   panel.webview.html = `<!doctype html><html><head>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src http://127.0.0.1:* http://localhost:*; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
 <style>html,body,iframe{margin:0;padding:0;border:0;width:100%;height:100vh;overflow:hidden}</style>
 </head><body><iframe src="${src}" allow="clipboard-read; clipboard-write"></iframe>
 <script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
   const frame = document.querySelector("iframe");
-  let selection = "";
   window.addEventListener("message", (e) => {
-    if (e.source === frame.contentWindow && e.data?.type === "drawout-selection") selection = e.data.text;
+    if (e.source === frame.contentWindow && e.data?.type?.startsWith("drawout-")) vscode.postMessage(e.data);
+    else if (e.data?.type === "drawout-paste") frame.contentWindow.postMessage(e.data, "*");
   });
-  document.addEventListener("paste", (e) => {
-    const text = e.clipboardData?.getData("text/plain");
-    if (text) frame.contentWindow.postMessage({ type: "drawout-paste", text }, "*");
-    e.preventDefault();
-  });
-  for (const kind of ["copy", "cut"]) {
-    document.addEventListener(kind, (e) => {
-      if (!selection) return;
-      e.clipboardData.setData("text/plain", selection);
-      e.preventDefault();
-    });
-  }
 </script></body></html>`;
 }
 
