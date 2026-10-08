@@ -2,7 +2,7 @@
 
 Draw-out is an app where agents build the views a team needs to understand its code and its work. T3 is the base: this repo is a fork of [T3 Code](https://github.com/pingdotgg/t3code), with T3's history and an `upstream` remote.
 
-- Plan and open questions: [Map: Draw-out as a VS Code extension](https://github.com/galer7/draw-out/issues/1). Read it before you pick a ticket.
+- Plan and open questions: [Map: Draw-out as an app on T3](https://github.com/galer7/draw-out/issues/1). Read it before you pick a ticket.
 - Principles: 1. the engineer's own subscriptions run every feature; 2. any codebase, any stack; 3. the agent prepares, the human decides; 4. a quiet reading mode; 5. ask for a view, get a view, and every view is an extension.
 - `galer7/t3code` holds patches for Gabriel's daily stock T3, not Draw-out code. Local clone: `~/p/_forks/t3code`.
 - Merge T3 fixes from `upstream/main`. Keep Draw-out changes out of T3's files where you can, so that upstream merges stay small.

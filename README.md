@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Draw-out** is a fork of T3 Code. Agents build the views a team needs to understand its code and its work. Plan: [Map: Draw-out as an app on T3](https://github.com/galer7/draw-out/issues/1). The rest of this README is T3's.
+
 # T3 Code
 
 T3 Code is an "agent harness control surface". It enables control of the agents on your machine with a best-in-class mobile app ([iOS](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824), [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), [web app](https://app.t3.codes) and [Electron-based desktop app](https://t3.codes).
